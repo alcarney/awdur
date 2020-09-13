@@ -1,15 +1,16 @@
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api';
-import { html, render } from "lit-html";
+import { LitElement, html, property, PropertyValues } from "lit-element";
 import { FileOpenAction, FileSaveAction } from './actions';
 import { registerFountainLang } from './fountain';
 import { EditorToolbar } from '../editor-toolbar';
+import { Script } from '../../services';
 
 registerFountainLang()
 
 // @ts-ignore
 self.MonacoEnvironment = {
   getWorkerUrl: function (moduleId, label) {
-    return "./editor.worker.bundle.js"
+    return "./editor.worker.js"
   }
 }
 
@@ -42,33 +43,60 @@ function newEditor(container: HTMLElement) {
   return editor
 }
 
-let template = () => html`
-<div class="flex flex-col h-screen overflow-hidden">
-  <editor-toolbar data-ref="toolbar"></editor-toolbar>
-  <div class="flex-grow p-1 bg-white" data-ref="editor"></div>
-  <footer>
-    <span></span>
-  </footer>
-</div>
-`
 
-export class FountainEditor extends HTMLElement {
-  static readonly ELEMENT_NAME = 'fountain-editor'
+export class FountainEditor extends LitElement {
+  public static ELEMENT_NAME = 'fountain-editor'
 
-  private container: HTMLElement
   private toolbar: EditorToolbar
   private editor: monaco.editor.ICodeEditor
 
-  constructor() {
-    super()
+  private currentScript: Script
+
+  createRenderRoot() {
+    return this
   }
 
-  connectedCallback() {
-    render(template(), this)
-
-    let editorContainer = <HTMLElement>this.querySelector('[data-ref="editor"]')
-    this.editor = newEditor(editorContainer)
-
-    this.toolbar = this.querySelector('[data-ref="toolbar"]')
+  render() {
+    return html`
+      <div class="h-full bg-white" data-ref="editor"></div>
+    `
   }
+
+  firstUpdated(changedProperties) {
+    let container = <HTMLElement>this.querySelector('[data-ref="editor"]')
+    container.addEventListener('new-script', () => this.newScript())
+    container.addEventListener('save-script', () => this.saveScript())
+    container.addEventListener('open-script', () => this.openOtherScript())
+    this.editor = newEditor(container)
+
+    this.toolbar = document.querySelector("editor-toolbar")
+    this.toolbar.setAttribute("show", "true")
+    this.toolbar.addEventListener('new-script', () => this.newScript())
+    this.toolbar.addEventListener('save-script', () => this.saveScript())
+    this.toolbar.addEventListener('open-script', () => this.openOtherScript())
+    this.dispatchEvent(new CustomEvent('ready'))
+  }
+
+  newScript() {
+    this.dispatchEvent(new CustomEvent('new-script'))
+  }
+
+  openScript(script: Script) {
+    this.currentScript = script
+    this.toolbar.scriptTitle = script.name
+    this.editor.setValue(script.content)
+  }
+
+  private openOtherScript() {
+    this.dispatchEvent(new CustomEvent('open-script'))
+  }
+
+  private saveScript() {
+    this.currentScript.content = this.editor.getValue()
+    this.currentScript.name = this.toolbar.scriptTitle
+    console.log(this.currentScript)
+
+    this.dispatchEvent(new CustomEvent('save-script', { detail: { script: this.currentScript } }))
+  }
+
 }

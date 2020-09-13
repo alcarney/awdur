@@ -1,5 +1,5 @@
 import { LitElement, html, internalProperty, property } from "lit-element";
-import { Icon } from "./editor/icon";
+import { Icon } from "./icon";
 
 
 export class ScriptTitle extends LitElement {
@@ -42,6 +42,8 @@ export class ScriptTitle extends LitElement {
 
     this.readOnly = true
     this.scriptTitle = input.value
+
+    this.dispatchEvent(new CustomEvent('rename', { detail: { title: input.value } }))
   }
 
   render() {
@@ -53,7 +55,7 @@ export class ScriptTitle extends LitElement {
                .value="${this.scriptTitle}"
                @change="${this.handleChange}"/>
 
-        <button class="bg-gray-600 rounded leading-none p-1 ml-2" @click="${this.handleClick}">
+        <button class="rounded leading-none p-1 ml-2" @click="${this.handleClick}">
           <x-icon name="${Icon.PENCIL}" class="inline-block w-6 h-6 ${this.readOnly ? '' : 'hidden'}"></x-icon>
           <x-icon name="${Icon.CHECK}" class=" inline-block w-6 h-6 ${this.readOnly ? 'hidden' : ''}"></x-icon>
         </button>

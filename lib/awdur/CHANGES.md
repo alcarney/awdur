@@ -1,3 +1,29 @@
+## v0.3.0 - 2026-11-03
+
+### Breaking Changes
+
+- Drop support for Python 3.11 and 3.12 ([#48](https://github.com/swyddfa/awdur/issues/48))
+
+### Features
+
+- By passing `:permissions: x` to the `awdur:file::` directive, it is now possible to mark exported files as executable. ([#35](https://github.com/swyddfa/awdur/issues/35))
+- `awdur` now supports reading fossil databases that use delta-compressed blobs.
+
+  Add Python 3.15 support ([#48](https://github.com/swyddfa/awdur/issues/48))
+
+### Enhancements
+
+- Add `-c`/`--clear-cache` flag to `awdur extract`, providing a convenient way to perform a fresh export. ([#50](https://github.com/swyddfa/awdur/issues/50))
+- `awdur` now supports incremental rebuilds of its core manifest. Meaning `fossil ui` can be used to browse the evolution of the project across multiple builds.
+
+  **Note:** It is still expected that `awdur.fossil` will be deleted on a regular basis, it's not yet stable enough for storing the long term history of a project. ([#51](https://github.com/swyddfa/awdur/issues/51))
+- When exporting projects, `awdur` checks for existing manifests at each revisin and only commits a manifest to the db when it has meaningfully changed. ([#53](https://github.com/swyddfa/awdur/issues/53))
+
+### Fixes
+
+- Fixed issue where the latest version of a project's manifest was not being selected, resulting in stale exports ([#50](https://github.com/swyddfa/awdur/issues/50))
+
+
 ## v0.2.0 - 2026-10-03
 
 ### Breaking Changes

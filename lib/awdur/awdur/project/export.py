@@ -9,16 +9,14 @@ if typing.TYPE_CHECKING:
     from typing import Literal
     from typing import Protocol
 
-    from . import ProjectManager
+    from . import RepoManager
 
     class ProjectExporter(Protocol):
         """Interface for exporters."""
 
         def __init__(self, logger: logging.Logger | None = None): ...
 
-        def export(
-            self, project: str, manager: ProjectManager, output: pathlib.Path
-        ): ...
+        def export(self, project: str, manager: RepoManager, output: pathlib.Path): ...
 
 
 class DirectoryExporter:
@@ -32,18 +30,12 @@ class DirectoryExporter:
         self.logger = logger or logging.getLogger(__name__)
         self.existing_files = existing_files
 
-    def export(self, project: str, manager: ProjectManager, output: pathlib.Path):
+    def export(self, project: str, repo: RepoManager, output: pathlib.Path):
         """Export the project to the given location."""
 
-        if (rid := manager.get_project_version(project)) is None:
-            self.logger.debug(
-                "Project %r is not defined or has not been rendered", project
-            )
-            return
-
-        if (blob := manager.get_blob(rid=rid)) is None:
-            self.logger.debug(
-                "Project %r is not defined or has not been rendered", project
+        if (blob := repo.get_project_version(project)) is None:
+            self.logger.error(
+                "Unable to export project %r, project does not exist", project
             )
             return
 
@@ -56,7 +48,7 @@ class DirectoryExporter:
         cmd: list[str] = [
             "fossil",
             "open",
-            str(manager.dbpath),
+            str(repo.dbpath),
             blob.uuid,
             "--workdir",
             str(output),

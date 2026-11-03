@@ -4,52 +4,180 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import enum
 import hashlib
+import itertools
+import logging
 import operator
 import os
 import pathlib
 import struct
 import typing
 import zlib
+from re import escape
 
 if typing.TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Generator
     from typing import Literal
 
     FilePermissions = Literal["w", "x", "l"]
+    FileStatus = Literal["created", "updated", "unchanged"]
+    TagType = Literal["+", "*", "-"]
 
-ASCII_SPACE = chr(0x20)
-ASCII_NL = chr(0x0A)
-ASCII_BSLASH = chr(0x5C)
 
-ESC_SPACE = chr(0x5C) + chr(0x73)
-ESC_NL = chr(0x5C) + chr(0x6E)
-ESC_BSLASH = 2 * ASCII_BSLASH
+class ASCII(enum.IntEnum):
+    """Names for 'interesting' ascii character values used in fossil's data formats."""
+
+    NEWLINE = 0x0A
+    SPACE = 0x20
+    COMMA = 0x2C
+    COLON = 0x3A
+    SEMICOLON = 0x3B
+    AT = 0x40
+    BACKSLASH = 0x5C
+
+    N = 0x6E
+    S = 0x73
+
+    @staticmethod
+    def escape(v: ASCII) -> str:
+        """Escape the given ascii character"""
+        match v:
+            case ASCII.SPACE:
+                v = ASCII.S
+            case ASCII.NEWLINE:
+                v = ASCII.N
+            case ASCII.BACKSLASH:
+                v = v
+            case _:
+                raise ValueError(f"Unable to escape character: {v!r}")
+
+        return chr(ASCII.BACKSLASH) + chr(v)
+
 
 UTC = dt.timezone.utc
 
 
 @typing.final
 @dataclasses.dataclass
-class Blob:
-    """Represents a record from the ``blob`` table."""
+class Artifact:
+    """Represents an item from the ``artifact`` view."""
 
     rid: int | None = dataclasses.field(default=None)
-    """The blob's row id"""
+    """The artifact's row id"""
 
     rcvid: int | None = dataclasses.field(default=None)
     """The rcvid."""
 
     size: int | None = dataclasses.field(default=None)
-    """The size of the uncompressed blob"""
+    """The size of the uncompressed artifact"""
 
-    uuid: str | None = dataclasses.field(default=None)
-    """The blob's hash"""
+    atype: int = dataclasses.field(default=1)
+    """The type of artifact (currently always 1)"""
 
-    content: bytes | None = dataclasses.field(default=None)
+    srcid: int | None = dataclasses.field(default=None)
+    """If this is a delta artifact, this stores the base blob's rid."""
+
+    uuid: str = dataclasses.field(default="")
+    """The artifact's hash"""
+
+    content: bytes = dataclasses.field(default=b"")
     """The content itself."""
 
-    _text: str | None = dataclasses.field(default=None, init=False)
+    _text: str = dataclasses.field(default="", init=False)
+    """Internal cache of the uncompressed text of the blob, if known"""
+
+    def __repr__(self):
+        return f"Artifact<{self.uuid}; {self.size} bytes>"
+
+    @classmethod
+    def find(
+        cls, db: sqlite3.Connection, *, rid: int | None = None, uuid: str | None = None
+    ):
+        """Find an artifact given its rid or uuid, if artifact is a delta, the delta
+        will be automatically applied."""
+
+        if rid is not None:
+            query = "SELECT * FROM artifact WHERE rid = ?"
+            params = (rid,)
+
+        elif uuid is not None:
+            query = "SELECT * FROM artifact WHERE hash = ?"
+            params = (uuid,)
+
+        else:
+            raise ValueError("Either rid or uuid must be provided")
+
+        cursor = db.execute(query, params)
+        if (row := cursor.fetchone()) is None:
+            return None
+
+        artifact = cls.fromdb(*row)
+
+        # Is this a delta blob?
+        if (srcid := artifact.srcid) is not None:
+            if (baseline := Blob.find(db, rid=srcid)) is None:
+                raise ValueError(
+                    f"Unable to resolve artifact, baseline blob rid={artifact.srcid} not found"
+                )
+
+            base_blob = zlib.decompress(baseline.content[4:])
+            delta_blob = zlib.decompress(artifact.content[4:])
+            artifact.content = apply_delta(base_blob, delta_blob)
+
+        else:
+            artifact.content = zlib.decompress(artifact.content[4:])
+
+        return artifact
+
+    @classmethod
+    def fromdb(
+        cls,
+        rid: int,
+        rcvid: int,
+        size: int,
+        atype: int,
+        srcid: int | None,
+        uuid: str,
+        content: bytes,
+    ):
+        return cls(rid, rcvid, size, atype, srcid, uuid, content)
+
+    @property
+    def text(self) -> str:
+        """Return the uncompressed text held in a blob."""
+        if self._text != "":
+            return self._text
+
+        if self.content == b"":
+            return ""
+
+        self._text = self.content.decode("utf8")
+        return self._text
+
+
+@typing.final
+@dataclasses.dataclass(repr=False)
+class Blob:
+    """Represents a record from the ``blob`` table."""
+
+    rid: int = dataclasses.field(default=-1)
+    """The blob's row id"""
+
+    rcvid: int = dataclasses.field(default=-1)
+    """The rcvid."""
+
+    size: int = dataclasses.field(default=0)
+    """The size of the uncompressed blob"""
+
+    uuid: str = dataclasses.field(default="")
+    """The blob's hash"""
+
+    content: bytes = dataclasses.field(default=b"")
+    """The content itself."""
+
+    _text: str = dataclasses.field(default="", init=False)
     """Internal cache of the uncompressed text of the blob, if known"""
 
     def __repr__(self):
@@ -62,11 +190,11 @@ class Blob:
         """Find a blob given its rid or uuid"""
 
         if rid is not None:
-            query = "SELECT * FROM BLOB WHERE rid = ?"
+            query = "SELECT * FROM blob WHERE rid = ?"
             params = (rid,)
 
         elif uuid is not None:
-            query = "SELECT * FROM BLOB WHERE uuid = ?"
+            query = "SELECT * FROM blob WHERE uuid = ?"
             params = (uuid,)
 
         else:
@@ -101,7 +229,7 @@ class Blob:
         size = len(bcontent)
         header = struct.pack(">I", size)
 
-        blob = cls(None, rcvid, size, uuid, header + data)
+        blob = cls(-1, rcvid, size, uuid, header + data)
         blob._text = content
 
         return blob
@@ -109,10 +237,10 @@ class Blob:
     @property
     def text(self) -> str:
         """Return the uncompressed text held in a blob."""
-        if self._text is not None:
+        if self._text != "":
             return self._text
 
-        if self.content is None:
+        if self.content == b"":
             return ""
 
         self._text = zlib.decompress(self.content[4:]).decode("utf8")
@@ -127,7 +255,7 @@ class Config:
     name: str
     value: str
     mtime: dt.datetime = dataclasses.field(
-        default_factory=lambda: dt.datetime.now(tz=UTC)
+        default_factory=lambda: dt.datetime.now(tz=UTC), repr=False
     )
 
     @classmethod
@@ -184,8 +312,7 @@ class Event:
         return event
 
 
-@typing.final
-@dataclasses.dataclass
+@dataclasses.dataclass(repr=False)
 class Manifest:
     """Represents a manifest entry corresponding with a check-in."""
 
@@ -197,19 +324,17 @@ class Manifest:
         filename: str
         """The filepath of the file, relative to the repo root."""
 
-        blob: Blob
+        blob: str
         """The blob holding the file's contents"""
 
-        permissions: FilePermissions | None = dataclasses.field(
-            default=None, kw_only=True
-        )
+        permissions: FilePermissions = dataclasses.field(default="w", kw_only=True)
         """The permissions to assign the file."""
 
         old_filename: str | None = dataclasses.field(default=None, kw_only=True)
         """If the file was renamed, this is the previous name."""
 
         def __str__(self):
-            parts = ["F", self.filename, self.blob.uuid]
+            parts = ["F", self.filename, self.blob]
 
             if self.permissions:
                 parts.append(self.permissions)
@@ -222,7 +347,7 @@ class Manifest:
     baseline: Blob | None = dataclasses.field(default=None, kw_only=True)
     """The baseline manifest, only used for delta manifests."""
 
-    comment: str | None = dataclasses.field(default=None, kw_only=True)
+    comment: str = dataclasses.field(default="", kw_only=True)
     """The check-in comment."""
 
     date: dt.datetime | None = dataclasses.field(default=None, kw_only=True)
@@ -234,8 +359,8 @@ class Manifest:
     mimetype: str | None = dataclasses.field(default=None, kw_only=True)
     """Mime type of the check-in comment"""
 
-    previous: list[str] = dataclasses.field(default_factory=list, kw_only=True)
-    """The previous manifest(s) this one supercedes."""
+    previous: str | None = dataclasses.field(default=None, kw_only=True)
+    """The previous manifest this one supercedes."""
 
     rchecksum: str | None = dataclasses.field(default=None, kw_only=True)
     """Checksum of all files included in check-in"""
@@ -243,38 +368,23 @@ class Manifest:
     tags: list[Tag] = dataclasses.field(default_factory=list, kw_only=True)
     """Tags."""
 
-    user: str | None = dataclasses.field(default=None, kw_only=True)
+    user: str = dataclasses.field(default="", kw_only=True)
     """The user who made the check-in"""
 
     zchecksum: str | None = dataclasses.field(default=None)
     """Checksum of the manifest record itself."""
 
-    uuid: str | None = dataclasses.field(default=None)
-    """The uuid of the this manifest's blob, if known"""
-
     def __repr__(self) -> str:
-        comment = "NO COMMENT"
-        if self.comment:
-            comment = self.comment.splitlines()[0]
-
         date = "NO DATE"
         if self.date:
             date = format_date(self.date)
 
-        return f"Manifest<{date}: {comment}; {len(self.files)} files>"
+        return f"Manifest<{date}: {self.comment}; {len(self.files)} files>"
 
     @classmethod
-    def fromblob(cls, blob: Blob):
+    def fromblob(cls, blob: Artifact | Blob):
         """Construct a manifest instance from a blob"""
-        manifest = cls.fromtext(blob.text)
-        manifest.uuid = blob.uuid
-        return manifest
-
-    def toblob(self, rcvid: int):
-        """Make a blob from this manifest."""
-        blob = Blob.create(self.build(), rcvid)
-        self.uuid = blob.uuid
-        return blob
+        return cls.fromtext(blob.text)
 
     @classmethod
     def fromtext(cls, text: str):
@@ -295,10 +405,10 @@ class Manifest:
                 case "F":
                     filename, uuid, *rest = value.split(" ")
                     # TODO: Handle permissions, old_filename
-                    manifest.files[filename] = Manifest.File(filename, Blob(uuid=uuid))
+                    manifest.files[filename] = Manifest.File(filename, uuid)
 
                 case "P":
-                    manifest.previous = [p for p in value.split(" ") if p]
+                    manifest.previous = value
 
                 case "R":
                     manifest.rchecksum = value
@@ -322,94 +432,98 @@ class Manifest:
     def add_file(
         self,
         filename: os.PathLike[str],
-        blob: Blob,
-        permissions: FilePermissions | None = None,
+        blob: str,
+        permissions: FilePermissions,
         old_filename: pathlib.Path | None = None,
-    ):
-        """Add a file to the manifest"""
+    ) -> tuple[Manifest.File, FileStatus]:
+        """Add a file to the manifest
+
+        Parameters
+        ----------
+        filename
+           The file's path relative to the root of the repo.
+
+        blob
+           The content's uuid
+
+        permissions
+           The file's permissions
+
+        old_filename
+           If the file was renamed, the previous name for the file.
+
+        Returns
+        -------
+        Manifest.File, FileStatus
+           The file's manifest record and a string indicating if the file is new, changed
+           relative to the previous version or unchanged.
+        """
         fname = escape_filename(filename)
         old_fname = None
 
         if old_filename:
             old_fname = escape_filename(old_filename)
 
-        self.files[fname] = Manifest.File(
+        pending_file = Manifest.File(
             fname, blob, permissions=permissions, old_filename=old_fname
         )
 
+        if (existing_file := self.files.get(fname)) is not None:
+            if existing_file == pending_file:
+                return existing_file, "unchanged"
+            else:
+                self.files[fname] = pending_file
+                return pending_file, "updated"
+        else:
+            self.files[fname] = pending_file
+            return pending_file, "created"
+
+    def get_file(self, filename: os.PathLike[str]) -> Manifest.File | None:
+        """Return the record for the given file if it exists, taking into account any
+        escape sequences."""
+        return self.files.get(escape_filename(filename))
+
+    def find_files(
+        self, *, prefix: str | None = None, contains: str | None = None
+    ) -> Generator[Manifest.File, None, None]:
+        """Find files that match the given criteria.
+
+        Parameters
+        ----------
+        prefix
+           Return files with a filepath matching the given prefix.
+
+        contains
+           Return files with a filepath containing the given value.
+
+        Returns
+        -------
+        Generator[Manifest.File, None, None]
+           A generator yielding matching entries
+        """
+        if prefix is not None:
+            prefix = escape_filename(pathlib.Path(prefix))
+
+        for fpath, file in self.files.items():
+            if prefix is not None and not fpath.startswith(prefix):
+                continue
+
+            if contains is not None and contains not in fpath:
+                continue
+
+            yield file
+
+    def delete_file(self, filename: os.PathLike[str]):
+        """Delete the given file from the manifest."""
+        if (fpath := escape_filename(filename)) in self.files:
+            del self.files[fpath]
+
     def add_tag(self, tag: Tag):
+        """Add a tag to the manifest."""
         self.tags.append(tag)
-
-    def make_delta(self):
-        """Made a delta manifest based on this one"""
-        raise NotImplementedError("TODO: Delta manifests")
-
-    def make_update(
-        self,
-        *,
-        comment: str | None = None,
-        date: dt.datetime | None = None,
-        mimetype: str | None = None,
-        tags: list[Tag] | None = None,
-        user: str | None = None,
-    ):
-        """Create a new full manifest based on this one."""
-
-        if self.uuid is None:
-            raise RuntimeError(
-                "Cannot make update, blob associated with this manifest is not known."
-            )
-
-        return Manifest(
-            baseline=None,  # full manifests cannot have a baseline
-            comment=comment,
-            date=date,
-            files=self.files,  # full manifests should specify every file
-            mimetype=mimetype,
-            previous=[self.uuid],
-            rchecksum=None,  # checksum should be recalculated
-            tags=tags or [],
-            user=user,
-            zchecksum=None,  # checksum should be recalculated
-        )
-
-    def validate(self):
-        """Check to see if we have a valid manifest."""
-
-        if self.comment is None or self.comment == "":
-            raise ValueError("Invalid manifest: a check-in comment is required")
-
-        if self.date is None:
-            raise ValueError("Invalid manifest: a check-in date is required")
-
-        if self.user is None:
-            raise ValueError(
-                "Invalid manifest: a check-in must be associated with a user"
-            )
-
-        for t in self.tags:
-            if t.uuid != "*":
-                raise ValueError(
-                    "Invalid tag: manifest tags must target '*' (i.e. self)"
-                )
-
-        # Calculate the repo checksum
-        rchecksum = hashlib.md5()
-        for _, file in sorted(self.files.items(), key=operator.itemgetter(0)):
-            item = f"{file.filename}{ASCII_SPACE}{len(file.blob.text)}{ASCII_NL}{file.blob.text}"
-            rchecksum.update(item.encode())
-
-        # If not set, assume we are computing it fresh for a build()
-        if self.rchecksum is None or self.rchecksum == "":
-            self.rchecksum = rchecksum.hexdigest()
-
-        # Otherwise, check it.
-        elif self.rchecksum != rchecksum.hexdigest():
-            raise ValueError("Invalid manifest: R card inconsitent with repo contents")
 
     def build(self) -> str:
         """Close the manifest by appending the ``Z`` checksum card and return it."""
-        self.validate()
 
         cards: list[str] = [
             f"C {escape_text(self.comment)}",
@@ -420,7 +534,7 @@ class Manifest:
             cards.append(str(file))
 
         if self.previous:
-            cards.append(f"P {' '.join(self.previous)}")
+            cards.append(f"P {self.previous}")
 
         # The rchecksum is optional
         if self.rchecksum is not None:
@@ -498,7 +612,7 @@ class Rcvfrom:
 class Tag:
     """Represents a ``T`` card."""
 
-    type: Literal["+", "*", "-"]
+    type: TagType
     """Indicates the propogation rules for the tag.
 
     - ``+``: One time application to the target artifact.
@@ -649,12 +763,12 @@ def escape_filename(filepath: os.PathLike[str]) -> str:
             f"Invalid path: {filename!r} path must be relative to project root"
         )
 
-    if ASCII_NL in filename or ASCII_BSLASH in filename:
+    if chr(ASCII.NEWLINE) in filename or chr(ASCII.BACKSLASH) in filename:
         raise ValueError(
             f"Invalid path: {filename!r}, newlines and backslashes are not permitted"
         )
 
-    return filename.replace(ASCII_SPACE, ESC_SPACE)
+    return filename.replace(chr(ASCII.SPACE), ASCII.escape(ASCII.SPACE))
 
 
 def escape_text(text: str) -> str:
@@ -670,9 +784,9 @@ def escape_text(text: str) -> str:
        -- `C card <https://fossil-scm.org/home/doc/trunk/www/fileformat.wiki#manifest>`__
     """
     return (
-        text.replace(ASCII_BSLASH, ESC_BSLASH)
-        .replace(ASCII_SPACE, ESC_SPACE)
-        .replace(ASCII_NL, ESC_NL)
+        text.replace(chr(ASCII.BACKSLASH), ASCII.escape(ASCII.BACKSLASH))
+        .replace(chr(ASCII.SPACE), ASCII.escape(ASCII.SPACE))
+        .replace(chr(ASCII.NEWLINE), ASCII.escape(ASCII.NEWLINE))
     )
 
 
@@ -689,13 +803,13 @@ def unescape_text(text: str) -> str:
        -- `C card <https://fossil-scm.org/home/doc/trunk/www/fileformat.wiki#manifest>`__
     """
     return (
-        text.replace(ESC_BSLASH, ASCII_BSLASH)
-        .replace(ESC_SPACE, ASCII_SPACE)
-        .replace(ESC_NL, ASCII_NL)
+        text.replace(ASCII.escape(ASCII.BACKSLASH), chr(ASCII.BACKSLASH))
+        .replace(ASCII.escape(ASCII.SPACE), chr(ASCII.SPACE))
+        .replace(ASCII.escape(ASCII.NEWLINE), chr(ASCII.NEWLINE))
     )
 
 
-def format_date(dt: dt.datetime) -> str:
+def format_date(datetime: dt.datetime) -> str:
     """Format a datetime for inclusion in a fossil record.
 
     .. pull-quote::
@@ -708,4 +822,106 @@ def format_date(dt: dt.datetime) -> str:
        - YYYY-MM-DDTHH:MM:SS
        - YYYY-MM-DDTHH:MM:SS.SSS
     """
-    return dt.isoformat("T", "milliseconds").replace("+00:00", "")
+    return datetime.isoformat("T", "milliseconds").replace("+00:00", "")
+
+
+def apply_delta(
+    baseline: bytes, delta: bytes, logger: logging.Logger | None = None
+) -> bytes:
+    """Apply the given fossil delta to the given baseline
+
+    see: https://fossil-scm.org/home/doc/trunk/www/delta_format.wiki
+    """
+    logger = logger or logging.getLogger(__name__)
+
+    point = delta.find(ASCII.NEWLINE)
+    header, delta = delta[:point], delta[point + 1 :]
+    target_length = b64_decode(header)
+    logger.debug("header: %r, target: %s bytes", header, target_length)
+
+    chunks: list[bytes] = []
+    buffer: list[int] = []
+
+    # Borrow mark and point terminology from Emacs
+    point = 0
+    checksum = None
+
+    while point < len(delta):
+        match b := delta[point]:
+            case ASCII.COLON:
+                length = b64_decode(buffer)
+                buffer.clear()
+
+                literal = delta[point + 1 : point + length + 1]
+                logger.debug("literal: %r bytes, %r ", length, literal)
+
+                chunks.append(literal)
+                buffer.clear()
+                point += length + 1
+
+            case ASCII.AT:
+                length = b64_decode(buffer)
+                buffer.clear()
+
+                mark = point + 1
+                point = mark + delta[mark:].index(ASCII.COMMA)
+                offset = b64_decode(delta[mark:point])
+                logger.debug("range: %r bytes, %r offset", length, offset)
+
+                chunks.append(baseline[offset : offset + length])
+                point += 1
+
+            case ASCII.SEMICOLON:
+                if point != len(delta) - 1:
+                    raise ValueError(
+                        "Failed to apply delta, trailer found before end of blob"
+                    )
+
+                checksum = b64_decode(buffer)
+                buffer.clear()
+                point += 1
+
+            case _:
+                point += 1
+                buffer.append(b)
+
+    # Validate the blob
+    if checksum is None:
+        raise ValueError("Failed to apply delta, incomplete payload")
+
+    content = b"".join(chunks)
+    if checksum != (actual := delta_checksum(content)):
+        raise ValueError(
+            f"Failed to apply delta, checksum mismatch: {checksum} != {actual}"
+        )
+    return content
+
+
+B64 = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~"
+TOP_BIT = 1 << 31
+
+
+def b64_decode(value: list[int] | bytes, signed: bool = False) -> int:
+    """Decode a base64 encoded 32bit int."""
+    v = 0
+    for shift, b in enumerate(reversed(value)):
+        v += B64.index(b) << (shift * 6)
+
+    # Negative numbers will have the top-bit set
+    if signed and (v & TOP_BIT) == TOP_BIT:
+        v -= 1 << 32
+
+    return v
+
+
+def delta_checksum(content: bytes) -> int:
+    """Calculate the "delta checksum" of the given blob"""
+    value = 0
+
+    if (rem := len(content) % 4) != 0:
+        content = b"".join([content, b"\x00" * (4 - rem)])
+
+    for b1, b2, b3, b4 in itertools.batched(content, n=4, strict=True):
+        value += (b1 << 24) + (b2 << 16) + (b3 << 8) + b4
+
+    return value & 0xFFFFFFFF

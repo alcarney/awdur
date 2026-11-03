@@ -9,11 +9,12 @@ from docutils.transforms import Transform
 from awdur.directives import code_block
 from awdur.directives import file
 from awdur.directives import project
-from awdur.project import Blob
-from awdur.project import ProjectManager
+from awdur.project import AwdurManifestBuilder
+from awdur.project import Manifest
+from awdur.project import RepoManager
 
 if typing.TYPE_CHECKING:
-    from awdur.project import ProjectManager
+    from awdur.project import RepoManager
 
 
 class CodeMetdataVisitor(nodes.SparseNodeVisitor):
@@ -111,7 +112,7 @@ class UpdateProjectTransform(Transform):
 
     def apply(self):
         settings = self.document.settings
-        manager: ProjectManager = settings.awdur_project_manager
+        manager: RepoManager = settings.awdur_project_manager
 
         if in_sphinx_build := "env" in dir(settings):
             # We are running in a Sphinx build.
@@ -121,48 +122,45 @@ class UpdateProjectTransform(Transform):
             filename = self.document.reporter.source
             src = self.document.rawsource
 
-        srcblob = Blob.create(src, -1)
+        if (manifest := manager.manifest) is None:
+            manifest = manager.start_update(f"Updated {filename}")
 
-        if manager.get_blob(uuid=srcblob.uuid) is not None:
-            manager.logger.debug("Source file %r up to date, nothing to do.", filename)
-            return
-
-        if not manager.updating:
-            manager.start_update(f"Updated {filename}")
-
-        _ = manager.add_src(src, filename)
-
-        self.update_files(manager)
-        self.update_codeblocks(manager)
+        srcfile, status = manifest.add_src(src, filename)
+        if status != "unchanged":
+            self.update_files(manifest)
+            self.update_codeblocks(manifest, srcfile)
 
         if not in_sphinx_build:
             # When running under sphinx we commit changes in one go during
             # 'write-started' event
             manager.commit_update()
 
-    def update_files(self, manager: ProjectManager):
+    def update_files(self, manifest: AwdurManifestBuilder):
         """Update based on all the file nodes in the document."""
 
         for node in self.document.findall(file):
             filename = node["filename"]
 
             if (project_name := node.attributes.get("in-project")) is None:
-                manager.logger.warning(
+                manifest.logger.warning(
                     "skipping file: %r, not part of any project: %r",
                     filename,
                     node.source,
                 )
                 continue
 
-            _ = manager.set_file_properties(
-                filename, project_name, template=node.attributes.get("use-template")
+            _ = manifest.set_file_properties(
+                filename,
+                project_name,
+                permissions=node.attributes.get("permissions"),
+                template=node.attributes.get("use-template"),
             )
 
-    def update_codeblocks(self, manager: ProjectManager):
+    def update_codeblocks(self, manifest: AwdurManifestBuilder, srcfile: Manifest.File):
         """Update based on all the code blocks in the document."""
         for node in self.document.findall(code_block):
             if (project_name := node.attributes.get("in-project")) is None:
-                manager.logger.debug(
+                manifest.logger.debug(
                     "skipping code block, not part of any project\n%s", node.astext()
                 )
                 continue
@@ -172,9 +170,10 @@ class UpdateProjectTransform(Transform):
             match node.attributes.get("kind"):
                 case "code":
                     if (filename := node.attributes.get("in-file")) is not None:
-                        _ = manager.add_fragment(
+                        _ = manifest.add_fragment(
                             code,
-                            filename=filename,
+                            srcpath=srcfile.filename,
+                            destpath=filename,
                             project=project_name,
                             slot=node.attributes.get("in-slot", "content"),
                             revision=node.attributes.get("at-revision", "1"),
@@ -182,10 +181,10 @@ class UpdateProjectTransform(Transform):
 
                 case "template":
                     name = node.attributes["name"]
-                    _ = manager.add_template(name, code, project_name)
+                    _ = manifest.add_template(name, code, project_name)
 
                 case _:
-                    manager.logger.warning(
+                    manifest.logger.warning(
                         "skipping code block, unknown kind %r\n%s", code
                     )
 
@@ -198,7 +197,7 @@ class RenderProjectTransform(Transform):
 
     def apply(self):
         try:
-            manager: ProjectManager = self.document.settings.awdur_project_manager
+            manager: RepoManager = self.document.settings.awdur_project_manager
         except AttributeError:
             # When registered as a post transform in Sphinx, there's no guarantee that
             # every document will have the `awdur_project_manager` set.
